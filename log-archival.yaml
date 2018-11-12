@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Create infra for log archive 
+
+# Cloudformation script to create a step function to export the cloudwatch logs to S3 via Lambda function. Schedule a cloudwatch event to trigger the step function daily.
+#
+#
+
+
+Parameters:
+  BucketName:
+    Description: Bucket name for log archive 
+    Type: String  
+    Default: log-archive
+  IamRole:
+    Description: IAM Role arn  
+    Type: String  
+
+
+Resources:
+  logArchiveLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code: ./logArchival
+      FunctionName: "log_archive"
+      Handler: "lambda_function.lambda_handler"
+      Role: !GetAtt sampleLogArchiveLambdaIamRole.Arn
+      Runtime: "python3.6"
+      MemorySize: 256
+      Timeout: 300
+
+  sampleLogArchiveLambdaIamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+          Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+          Version: '2012-10-17'
+      Path: /
+      Policies:
+        - 
+          PolicyName: "logArchLambdaPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - 
+                Action: "sts:AssumeRole"
+                Effect: "Allow"
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      
+  sampleLogArchiveStateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties: 
+      DefinitionString:
+        !Sub
+          - |-
+            {
+              "Comment": "Step Function to archive cloudwatch logs to S3",
+              "StartAt": "CreateExportTask",
+              "States": {
+                  "CreateExportTask": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:lambda:us-east-1:99999999:function:log_archive",
+                      "Next": "IsAllLogsExported"
+                  },
+                  "IsAllLogsExported": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                              "Variable": "$.delay",
+                              "BooleanEquals": true,
+                              "Next": "wait_xx_seconds"
+                          },
+                          {
+                              "Variable": "$.continue",
+                              "BooleanEquals": true,
+                              "Next": "CreateExportTask"
+                          }
+                      ],
+                      "Default": "SuccessState"
+                  },
+                "wait_ten_seconds": {
+                "Type": "Wait",
+                "Seconds": 10,
+                "Next": "CreateExportTask"
+                },
+                  "SuccessState": {
+                      "Type": "Succeed"
+                  }
+              }
+            }
+          - {}
+      RoleArn: !GetAtt sampleStateExecutionRole.Arn
+
+  sampleStateExecutionRole: 
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Service:
+                - !Sub states.us-east-1.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: !GetAtt logArchiveLambdaFunction.Arn
+
+  sampleLogArchiveS3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties: 
+      BucketName: !Sub service-log-${BucketName}
+      LifecycleConfiguration:
+        Rules:
+        - Id: logArchiveRule
+          Status: Enabled
+          ExpirationInDays: '60'
+
+
+
+  logArchiveS3BucketPolicy: 
+    Type: "AWS::S3::BucketPolicy"
+    Properties: 
+      Bucket: !Ref sampleLogArchiveS3Bucket
+      PolicyDocument:
+        Statement: 
+          - 
+            Action: "s3:*"
+            Effect: Allow
+            Resource: 
+              - !GetAtt sampleLogArchiveS3Bucket.Arn
+              - !Join ['', [!GetAtt sampleLogArchiveS3Bucket.Arn, '/*']]
+            Principal: 
+              Service: logs.us-east-1.amazonaws.com
+
+  # event create to execute step fucntion 
+  samplelogArchiveSchedulerEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Daily Schedule to archive logs"
+      Name: "service-log-archive"
+      ScheduleExpression: cron(0, 23, *, *, ?, *)
+      State: "ENABLED"
+      Targets:
+        - 
+          Arn: !Ref logArchiveStateMachine
+          Id: "LogArchiveFunction"
+          RoleArn: !GetAtt eventExecutionRole.Arn
+          Input:
+            |-
+              {
+                "region": "us-east-1",
+                "env": "nonprod"
+              }
+
+  eventExecutionRole: 
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Service: events.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: EventExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "states:StartExecution"
+                Resource: !Ref logArchiveStateMachine
